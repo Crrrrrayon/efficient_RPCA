@@ -1,7 +1,6 @@
 function [q ]= KGDE(X,  max_rank)
 % Inputs:
 % X: Input matrix.
-% m: Parameter.
 % max_rank
 % Output:
 % q: Estimated rank.
