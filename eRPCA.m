@@ -1,4 +1,4 @@
-function [ L, S] = eRPCA( D, para )
+function [ L, S, L_conv, S_conv] = eRPCA( D, para )
 %
 % Inputs:
 % D : Observed matrix. Sum of underlying low rank matrix and underlying
@@ -79,8 +79,7 @@ timer  = zeros(max_iter,1);
 tic
 [m,n] = size(D);
 % Estimate Rank by KGDE
-m1 = 10; % parameter
-rank_N(1) = KGDE(D,m1,min(m,n));
+rank_N(1) = KGDE(D,min(m,n));
 rankN = rank_N(1);
 
 siz_col = ceil(con*rankN);
@@ -142,13 +141,13 @@ for t = 1 : max_iter
     end
     
     % Estimate Rank per Iteration
-%     rak(t+1) = rank(D_cols-S_cols);
-%     rank_N(t+1) = KGDE(D_cols-S_cols,m1,min(m,n));
-%     if rank_N==0
-%         rank_N = 1;
-%     end
-%     rankN = rank_N(t+1);
-%     disp(['Rank =',num2str(rankN),',iter = ',num2str(t)])
+    rak(t+1) = rank(D_cols-S_cols);
+    rank_N(t+1) = KGDE(D_cols-S_cols, min(m,n));
+    if rank_N==0
+        rank_N = 1;
+    end
+    rankN = rank_N(t+1);
+    disp(['Rank =',num2str(rankN),',iter = ',num2str(t)])
     
     [C,sig1] = DCsolver(D_cols-S_cols,mu2/lambda,sig1,gamma,rankN);
     [R,sig2] = DCsolver(D_rows-S_rows,mu2/lambda,sig2,gamma,rankN);
@@ -164,6 +163,10 @@ for t = 1 : max_iter
     err(t) = (norm(D_rows-L_rows-S_rows, 'fro') + norm(D_cols-L_cols-S_cols, 'fro')) / norm_of_D;
     timer(t) = toc;
     
+    % L,S Convergence
+    L_conv(t) = (norm(D_rows-S_rows, 'fro') + norm(D_cols-S_cols, 'fro')) / norm_of_D;
+    S_conv(t) = (norm(D_rows-L_rows, 'fro') + norm(D_cols-L_cols, 'fro')) / norm_of_D;
+
     if err(t) < tol
         fprintf('Total %d iteration, final error: %e, total time: %f  \n', t, err(t), sum(timer(timer>0)));
         timer(1) = timer(1) + init_timer;
