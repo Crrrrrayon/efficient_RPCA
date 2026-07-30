@@ -1,70 +1,236 @@
-function [q ]= KGDE(X,  max_rank)
-% Inputs:
-% X: Input matrix.
-% max_rank
-% Output:
-% q: Estimated rank.
+function [rank_est, info] = KGDE(X, max_rank, opts)
+%KGDE Estimate matrix rank using Block Krylov accelerated GDE.
 
-[p,n] = size(X);  % get size
-%% Main routine
+if nargin < 2 || isempty(max_rank)
+    max_rank = min(64, min(size(X)));
+end
+if nargin < 3
+    opts = struct();
+end
 
-v=randn(p,1); V=v/norm(v);  % crerate a random vector for Lanczos
-T=[];
+%% Step 1: Prepare the working matrix and search settings
+start_time = tic;
+[m, n] = size(X);
+max_rank = min(max_rank, min(m, n));
+side = option(opts, 'covariance_side', 'smaller');
 
-for k=1:max_rank
-    [U, V, T, Theta] = Lanczos_update(X, V, T, k+1);   % get the next eigenpairs using the Lanczos algorithm
-    % GDE
-    R_k = V*diag(Theta)*U;
-    RR = R_k'*R_k;
-    [V_eig,D_eig]=eigs(RR);
-    [D_sort,index] = sort(diag(D_eig),'descend');
-    D_sort = diag(D_sort);
-    V_sort = V_eig(:,index);
-    
-    R = V_sort*D_sort*V_sort';
-    [M1,N1]=size(R);
-    R_A_T = zeros(M1-1,N1-1);
-    for p1=1:M1-1
-        for q1=1:M1-1
-            R_A_T(p1,q1)=R(p1,q1);
-        end
-    end
-    [V_new,D_new]=eig(R_A_T);
-    t=zeros(M1-1,1);
-    T_new=[V_new t;t' 1];
-    R1 = R;
-    T1 = T_new;
-    R_T=T1'*R1*T1;
-    r_r_1 = zeros(1,N1-1);
-    for i=1:N1-1
-        r_r_1(i)=abs(R_T(i,N1));
-    end
-    D1=diag(D_new);
-    
-    D_seta_N=1/sqrt(D1'*D1);
-    D_seta = D1*D_seta_N;
-    % Shrink
-    r_r = r_r_1';
-    r_r = r_r.*D_seta;
-    r=abs(r_r');
-    
-    if N1<=2
-        j=2;
-    else
-        for j=1:N1-2
-            D_M=abs(2*D1(j+1))/(sqrt(D1(j:N1-1)'*D1(j:N1-1)));
-            m_seta_r=sum(r);
-            D_MM = D_M*(m_seta_r/(N1-1));
-            GDE_K(j)=r(j)-D_MM;
-            if GDE_K(j)<0
-                break;
-            end
-        end
-    end
-    if k>1 && j<k
+if strcmp(side, 'left') || (strcmp(side, 'smaller') && m <= n)
+    A = X;
+    side = 'left';
+else
+    A = X';
+    side = 'right';
+end
+
+search_rank = min(max(option(opts, ...
+    'initial_search_rank', 2), 1), max_rank);
+q = option(opts, 'krylov_steps', 3);
+seed = option(opts, 'seed', 1);
+
+search_trace = [];
+rank_trace = [];
+
+while true
+    %% Step 2: Build the dominant subspace with Block Krylov iteration
+    [U, theta, bki_info] = block_krylov(A, search_rank, q, seed);
+
+    %% Step 3: Form the covariance factor used by GDE
+    F = U * diag(sqrt(theta));
+
+    %% Step 4: Apply the paper GDE rank decision
+    [candidate, gde_info] = factor_gde(F);
+
+    search_trace(end+1, 1) = search_rank; %#ok<AGROW>
+    rank_trace(end+1, 1) = candidate; %#ok<AGROW>
+
+    %% Step 5: Stop or enlarge the Krylov search dimension
+    inside_search = ~isempty(gde_info.first_negative_index) ...
+        && gde_info.decision_index < search_rank;
+    if inside_search || search_rank == max_rank
         break;
     end
+    search_rank = min(2 * search_rank, max_rank);
 end
-q=j-1;   % estimated rank
+
+rank_est = candidate;
+if inside_search
+    status = 'rank_found';
+else
+    status = 'maximum_search_rank_reached';
+end
+
+%% Step 6: Return reusable left and right singular subspaces
+[left_basis, right_basis, singular_values] = ...
+    singular_subspaces(X, U, theta, rank_est, side);
+
+info = struct( ...
+    'rank', rank_est, ...
+    'status', status, ...
+    'covariance_side', side, ...
+    'final_search_rank', search_rank, ...
+    'maximum_search_rank', max_rank, ...
+    'krylov_steps', q, ...
+    'seed', seed, ...
+    'search_rank_trace', search_trace, ...
+    'candidate_rank_trace', rank_trace, ...
+    'covariance_factor', F, ...
+    'left_basis', left_basis, ...
+    'right_basis', right_basis, ...
+    'singular_values', singular_values, ...
+    'bki_info', bki_info, ...
+    'gde_info', gde_info, ...
+    'total_time', toc(start_time));
+end
 
 
+function [U, theta, info] = block_krylov(X, k, q, seed)
+%BLOCK_KRYLOV Approximate the dominant covariance eigenspace.
+
+[m, n] = size(X);
+
+% Create the random starting block.
+rng(seed, 'twister');
+Omega = randn(n, k);
+
+% Expand and collect all Krylov blocks.
+K = zeros(m, min(m, (q + 1) * k));
+Y = X * Omega;
+first = 1;
+
+for j = 0:q
+    scale = norm(Y, 'fro');
+    if scale == 0
+        break;
+    end
+    Y = Y / scale;
+
+    last = min(first + k - 1, size(K, 2));
+    width = last - first + 1;
+    if width <= 0
+        break;
+    end
+    K(:, first:last) = Y(:, 1:width);
+    first = last + 1;
+
+    if j < q
+        Y = X * (X' * Y);
+    end
+end
+
+% Orthonormalize the complete Krylov subspace.
+K = K(:, 1:first-1);
+[Q, ~] = qr(K, 0);
+
+% Extract the dominant directions by Rayleigh--Ritz.
+B = Q' * (X * (X' * Q));
+B = full((B + B') / 2);
+
+[W, D] = eig(B);
+[all_theta, order] = sort(real(diag(D)), 'descend');
+W = W(:, order);
+
+theta = max(all_theta(1:k), 0);
+U = Q * W(:, 1:k);
+
+info = struct( ...
+    'target_rank', k, ...
+    'krylov_steps', q, ...
+    'krylov_dimension', size(K, 2), ...
+    'ritz_values', all_theta, ...
+    'orthogonality_error', norm(U' * U - eye(k), 'fro'));
+end
+
+
+function [rank_est, info] = factor_gde(F)
+%FACTOR_GDE Apply the GDE decision without forming a large covariance.
+
+[k, width] = size(F);
+
+% Obtain the leading-block spectrum and disk radii.
+F1 = F(1:k-1, :);
+f = F(k, :)';
+[~, S, V] = svd(full(F1), 'econ');
+s = real(diag(S));
+count = min(numel(s), k-1);
+s = s(1:count);
+V = V(:, 1:count);
+
+lambda = zeros(k-1, 1);
+raw_radii = zeros(k-1, 1);
+lambda(1:count) = s .^ 2;
+raw_radii(1:count) = abs(s .* (V' * f));
+
+% Shrink the disk radii.
+scaled_radii = abs(lambda) .* raw_radii / norm(lambda);
+
+% Evaluate the GDE score for every candidate rank.
+scores = zeros(k-2, 1);
+adjustment = zeros(k-2, 1);
+for t = 1:k-2
+    tail_norm = norm(lambda(t:k-1));
+    adjustment(t) = 2 * abs(lambda(t+1)) / tail_norm;
+    scores(t) = scaled_radii(t) ...
+        - adjustment(t) * mean(scaled_radii);
+end
+
+% Return the rank before the first negative score.
+first_negative = find(scores(2:end) < 0, 1);
+if ~isempty(first_negative)
+    first_negative = first_negative + 1;
+end
+if isempty(first_negative)
+    decision_index = k - 2;
+    status = 'no_negative_score';
+else
+    decision_index = first_negative;
+    status = 'rank_found';
+end
+rank_est = decision_index - 1;
+
+info = struct( ...
+    'rank', rank_est, ...
+    'status', status, ...
+    'factor_width', width, ...
+    'leading_eigenvalues', lambda, ...
+    'raw_radii', raw_radii, ...
+    'scaled_radii', scaled_radii, ...
+    'scores', scores, ...
+    'adjustment_factors', adjustment, ...
+    'first_negative_index', first_negative, ...
+    'decision_index', decision_index);
+end
+
+
+function [UL, VR, singular_values] = ...
+        singular_subspaces(X, U, theta, rank_est, side)
+%SINGULAR_SUBSPACES Build reusable singular vectors after rank selection.
+
+UL = zeros(size(X, 1), 0);
+VR = zeros(size(X, 2), 0);
+singular_values = zeros(0, 1);
+
+if ~isfinite(rank_est) || rank_est < 1
+    return;
+end
+
+r = min(rank_est, numel(theta));
+singular_values = sqrt(theta(1:r));
+safe_values = max(singular_values, eps(class(singular_values)));
+
+if strcmp(side, 'left')
+    UL = U(:, 1:r);
+    VR = (X' * UL) ./ safe_values';
+else
+    VR = U(:, 1:r);
+    UL = (X * VR) ./ safe_values';
+end
+end
+
+
+function value = option(opts, name, default_value)
+if isfield(opts, name) && ~isempty(opts.(name))
+    value = opts.(name);
+else
+    value = default_value;
+end
+end
